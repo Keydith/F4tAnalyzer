@@ -1,10 +1,12 @@
 // ==UserScript==
 // @name         Free4Talk Analyzer
-// @version      14.9.14
+// @version      14.11.2
 // @description  Improve discoverability of F4T rooms
 // @author       You
 // @match        https://www.free4talk.com/
-// @grant        none
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @grant        unsafeWindow
 // @run-at       document-start
 // ==/UserScript==
 
@@ -12,9 +14,14 @@
     'use strict';
 
     // --- Global State ---
-    window.F4T_DB = window.F4T_DB || new Map();
+    // We attach to unsafeWindow so the 'real' page can potentially see it, 
+    // or just to keep it on the main window object.
+    unsafeWindow.F4T_DB = unsafeWindow.F4T_DB || new Map();
     let isOverlayOpen = false;
     let refreshInterval = null;
+
+    // --- Configuration ---
+    const STORAGE_KEY = 'settings_v1';
     
     const F4T_LEVELS = [
         "Any Level", "Beginner", "Upper Beginner", 
@@ -22,20 +29,59 @@
         "Advanced", "Upper Advanced"
     ];
 
-    // --- Network Interceptor ---
-    const originalFetch = window.fetch;
-    window.fetch = async function(...args) {
-        const response = await originalFetch(...args);
+    const DEFAULT_SETTINGS = {
+        lang: "English",
+        secLang: "",
+        minSlots: 1,
+        sort: "score_desc",
+        reqMic: true,
+        levels: [...F4T_LEVELS]
+    };
+
+    // --- Helper: Reliable Load/Save ---
+    function getSettings() {
+        const stored = GM_getValue(STORAGE_KEY, null);
+        console.log("[F4T] Loaded Settings:", stored);
+        if (stored && typeof stored === 'string') {
+            try {
+                // Merge defaults to ensure no missing keys
+                return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
+            } catch (e) {
+                console.error("[F4T] Parse Error", e);
+            }
+        }
+        return DEFAULT_SETTINGS;
+    }
+
+    function saveSettings(settings) {
+        try {
+            const json = JSON.stringify(settings);
+            GM_setValue(STORAGE_KEY, json);
+            // console.log("[F4T] Saved:", json); // Uncomment to debug
+        } catch (e) { console.error("[F4T] Save Error", e); }
+    }
+
+    // --- Network Interceptor (Sandboxed) ---
+    // Since we are in sandbox (due to grants), we hook unsafeWindow.fetch
+    const originalFetch = unsafeWindow.fetch;
+    
+    // We must define the hook on the unsafeWindow to capture page requests
+    // Note: In some strict environments (Firefox), exportFunction might be needed,
+    // but usually direct assignment works for Chrome/Tampermonkey.
+    unsafeWindow.fetch = async function(...args) {
+        const response = await originalFetch.apply(this, args);
         const url = args[0] ? args[0].toString() : '';
 
         if (url.includes('/sync/get/free4talk/groups')) {
+            // Clone response to read body without consuming it
             const clone = response.clone();
             clone.json().then(json => {
+                // Must access unsafeWindow global for DB
                 if (json && json.data) {
                     Object.values(json.data).forEach(room => {
-                        if (room.id) window.F4T_DB.set(room.id, room);
+                        if (room.id) unsafeWindow.F4T_DB.set(room.id, room);
                     });
-                    updateLaunchButton(window.F4T_DB.size);
+                    updateLaunchButton(unsafeWindow.F4T_DB.size);
                 }
             }).catch(() => {});
         }
@@ -55,14 +101,11 @@
             c.score = (friends + 1) / (following + followers - friends + 2);
             c.score *= 1 - 0.5 * (Math.abs(following - friends) + 1) / ((following + followers - friends) + 2);
             c.score *= 1 - 0.5 * (Math.abs(followers - friends) + 1) / ((following + followers - friends) + 2);
-
             return c.score;
         });
 
-        // Geometric Mean
         const product = scores.reduce((acc, val) => acc * val, 1);
         const geoMean = Math.pow(product, 1 / scores.length);
-
         return Math.round(geoMean * 1000) / 100;
     }
 
@@ -76,7 +119,7 @@
         
         const levelChecksHtml = F4T_LEVELS.map(lvl => `
             <label class="f4t-chip">
-                <input type="checkbox" value="${lvl}" checked class="f4t-level-cb">
+                <input type="checkbox" value="${lvl}" class="f4t-level-cb">
                 <span>${lvl}</span>
             </label>
         `).join('');
@@ -90,26 +133,24 @@
                         <span id="f4t-match-count">0</span> / <span id="f4t-total-count">0</span>
                     </div>
                 </div>
-                
                 <div class="f4t-search-container">
                     <input type="text" id="f4t-search" placeholder="Search topic or user...">
                 </div>
-
                 <button id="f4t-close">✕</button>
             </div>
 
             <div class="f4t-toolbar">
                 <div class="f4t-field">
                     <label>Lang</label>
-                    <input type="text" id="f4t-lang" value="English" placeholder="Any">
+                    <input type="text" id="f4t-lang" placeholder="Any">
                 </div>
                 <div class="f4t-field" style="flex:1.5">
                     <label>2nd Lang</label>
-                    <input type="text" id="f4t-sec" value="" placeholder="E.g: None, Spanish">
+                    <input type="text" id="f4t-sec" placeholder="E.g: None, Spanish">
                 </div>
                 <div class="f4t-field" style="flex:0.8">
                     <label>Min Slots</label>
-                    <input type="number" id="f4t-slots" value="1" min="0">
+                    <input type="number" id="f4t-slots" min="0">
                 </div>
                 <div class="f4t-field" style="flex:1.5">
                     <label>Sort</label>
@@ -122,32 +163,47 @@
                 
                 <div class="f4t-field-btn">
                     <label class="f4t-toggle-btn">
-                        <input type="checkbox" id="f4t-req-mic" checked>
+                        <input type="checkbox" id="f4t-req-mic">
                         <span>🎤 Mic Only</span>
                     </label>
                 </div>
             </div>
 
-            <div class="f4t-level-bar">
-                ${levelChecksHtml}
-            </div>
-
+            <div class="f4t-level-bar">${levelChecksHtml}</div>
             <div id="f4t-grid" class="f4t-grid"></div>
         </div>
         `;
 
         document.body.appendChild(overlay);
 
+        // --- RESTORE SETTINGS ---
+        // We explicitly set values AFTER adding elements to DOM
+        const s = getSettings();
+        
+        document.getElementById('f4t-lang').value = s.lang || "";
+        document.getElementById('f4t-sec').value = s.secLang || "";
+        document.getElementById('f4t-slots').value = s.minSlots || 0;
+        document.getElementById('f4t-sort').value = s.sort || "score_desc";
+        document.getElementById('f4t-req-mic').checked = !!s.reqMic;
+
+        // Restore Levels
+        const boxes = overlay.querySelectorAll('.f4t-level-cb');
+        boxes.forEach(cb => {
+            cb.checked = s.levels.includes(cb.value);
+        });
+
+        // Event Listeners
         const inputs = overlay.querySelectorAll('input, select');
         inputs.forEach(el => {
-            el.addEventListener('input', render);
-            el.addEventListener('change', render);
+            // 'input' fires on every keystroke, 'change' fires on blur/select
+            el.addEventListener('input', () => { render(); }); 
+            el.addEventListener('change', () => { render(); }); 
         });
 
         document.getElementById('f4t-close').onclick = closeOverlay;
 
         isOverlayOpen = true;
-        render();
+        render(); // This will trigger a save, confirming persistence works immediately
         refreshInterval = setInterval(render, 5000);
     }
 
@@ -162,30 +218,34 @@
     function render() {
         if (!isOverlayOpen) return;
 
-        const search = document.getElementById('f4t-search').value.toLowerCase().trim();
-        const langInput = document.getElementById('f4t-lang').value.trim();
-        
-        // --- Parse Second Language Input ---
-        const secInputRaw = document.getElementById('f4t-sec').value;
-        const secInput = secInputRaw.split(',')
-            .map(s => s.trim())
-            .filter(s => s !== "")
-            .map(s => {
-                // Map 'none' to empty string to allow filtering for rooms with NO second language
-                if (s.toLowerCase() === 'none') return "";
-                return s;
-            });
+        // 1. Capture Values
+        const searchVal = document.getElementById('f4t-search').value.toLowerCase().trim();
+        const langVal = document.getElementById('f4t-lang').value.trim();
+        const secValRaw = document.getElementById('f4t-sec').value;
+        const slotsVal = parseInt(document.getElementById('f4t-slots').value) || 0;
+        const sortVal = document.getElementById('f4t-sort').value;
+        const micVal = document.getElementById('f4t-req-mic').checked;
+        const levelEls = document.querySelectorAll('.f4t-level-cb:checked');
+        const levelVals = Array.from(levelEls).map(cb => cb.value);
 
-        const minSlots = parseInt(document.getElementById('f4t-slots').value) || 0;
-        const reqMic = document.getElementById('f4t-req-mic').checked;
-        const sortMode = document.getElementById('f4t-sort').value;
-        const selectedLevels = Array.from(document.querySelectorAll('.f4t-level-cb:checked')).map(cb => cb.value);
+        // 2. Save Immediately
+        saveSettings({
+            lang: langVal,
+            secLang: secValRaw,
+            minSlots: slotsVal,
+            sort: sortVal,
+            reqMic: micVal,
+            levels: levelVals
+        });
 
-        const grid = document.getElementById('f4t-grid');
+        // 3. Logic
+        const secList = secValRaw.split(',').map(s => s.trim()).filter(s => s !== "").map(s => s.toLowerCase() === 'none' ? "" : s);
         const matchBadge = document.getElementById('f4t-match-count');
         const totalBadge = document.getElementById('f4t-total-count');
+        const grid = document.getElementById('f4t-grid');
 
-        let items = Array.from(window.F4T_DB.values()).map(room => ({
+        // Note: accessing unsafeWindow.F4T_DB here
+        let items = Array.from(unsafeWindow.F4T_DB.values()).map(room => ({
             ...room,
             _score: calculateSmartScore(room),
             _date: new Date(room.createdAt)
@@ -193,51 +253,35 @@
 
         items = items.filter(i => {
             let pass = true;
-            
-            // 1. Search Filter
-            if (search) {
-                const topicMatch = (i.topic || "").toLowerCase().includes(search);
-                const userMatch = i.clients.some(c => (c.name || "").toLowerCase().includes(search));
+            if (searchVal) {
+                const topicMatch = (i.topic || "").toLowerCase().includes(searchVal);
+                const userMatch = i.clients.some(c => (c.name || "").toLowerCase().includes(searchVal));
                 if (!topicMatch && !userMatch) pass = false;
             }
-
-            // 2. Language Filter (Only if input is not empty)
-            if (pass && langInput) {
-                pass = (i.language === langInput);
-            }
-
-            // 3. Level Filter
-            if (pass && !selectedLevels.includes(i.level)) pass = false;
-
-            // 4. Slots Filter
+            if (pass && langVal && i.language !== langVal) pass = false;
+            if (pass && !levelVals.includes(i.level)) pass = false;
             if (pass) {
                 if (!i.clients || i.clients.length === 0) pass = false;
-                else if (i.maxPeople > 0 && (i.maxPeople - i.clients.length < minSlots)) pass = false;
+                else if (i.maxPeople > 0 && (i.maxPeople - i.clients.length < slotsVal)) pass = false;
             }
-
-            // 5. Second Language Filter (Only if input has content)
-            // If input is empty string, we skip this check (disable filter)
-            if (pass && secInputRaw.trim() !== "") {
+            if (pass && secValRaw.trim() !== "") {
                 const roomSec = i.secondLanguage || "";
-                pass = secInput.includes(roomSec);
+                pass = secList.includes(roomSec);
             }
-
-            // 6. Mic & Lock settings
-            if (pass && reqMic && i.settings.noMic) pass = false;
+            if (pass && micVal && i.settings.noMic) pass = false;
             if (pass && i.settings.isLocked) pass = false;
-            
             return pass;
         });
 
         items.sort((a, b) => {
-            if (sortMode === 'score_desc') return b._score - a._score;
-            if (sortMode === 'score_asc') return a._score - b._score;
-            if (sortMode === 'recent') return b._date - a._date;
+            if (sortVal === 'score_desc') return b._score - a._score;
+            if (sortVal === 'score_asc') return a._score - b._score;
+            if (sortVal === 'recent') return b._date - a._date;
             return 0;
         });
 
         if (matchBadge) matchBadge.textContent = items.length;
-        if (totalBadge) totalBadge.textContent = window.F4T_DB.size;
+        if (totalBadge) totalBadge.textContent = unsafeWindow.F4T_DB.size;
 
         if (items.length === 0) {
             grid.innerHTML = '<div class="f4t-empty">No rooms match criteria</div>';
@@ -247,21 +291,14 @@
         grid.innerHTML = items.map(item => {
             const isRisky = item._score < 2.5;
             const cardClass = isRisky ? 'f4t-card-neg' : '';
-            
-            let scoreColor = '#66bb6a'; 
-            if (item._score < 5.0) scoreColor = '#ffee58';
-            if (item._score < 2.5) scoreColor = '#ff5252';
-
+            let scoreColor = item._score < 2.5 ? '#ff5252' : (item._score < 5.0 ? '#ffee58' : '#66bb6a');
             const btnClass = isRisky ? 'f4t-btn-risky' : 'f4t-btn-safe';
-            const btnText = isRisky ? '⚠️ Join' : 'Join';
+            const btnText = isRisky ? 'Join' : 'Join';
 
             const members = item.clients.map(c => {
                 const isHost = c.id === item.creator.id;
                 const diff = (c.following || 0) - (c.followers || 0);
-                
-                let statColor = '#66bb6a';
-                if (c.score < .5) statColor = '#ffb74d';
-                if (c.score < .25) statColor = '#ff5252';
+                let statColor = c.score < .25 ? '#ff5252' : (c.score < .5 ? '#ffb74d' : '#66bb6a');
                 
                 return `
                 <div class="f4t-mem">
@@ -271,9 +308,7 @@
                     </div>
                     <div class="f4t-mem-info">
                         <div class="f4t-mem-name">${escapeHtml(c.name)}</div>
-                        <div class="f4t-mem-stats" style="color:${statColor}">
-                            Diff: ${diff} | Fr: ${c.friends}
-                        </div>
+                        <div class="f4t-mem-stats" style="color:${statColor}">Diff: ${diff} | Fr: ${c.friends}</div>
                     </div>
                 </div>`;
             }).join('');
@@ -303,16 +338,22 @@
         }).join('');
     }
 
-    function escapeHtml(t) { return t ? t.replace(/&/g, "&amp;").replace(/</g, "&lt;") : ""; }
+    function escapeHtml(t) { return t ? t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;") : ""; }
+
     function getTimeAgo(d) {
-        const m = Math.floor((new Date()-d)/60000);
-        if(m<1) return "Now"; if(m<60) return m+"m"; 
-        const h=Math.floor(m/60); return h<24 ? h+"h" : Math.floor(h/24)+"d";
+        const m = Math.floor((new Date() - d) / 60000);
+        if(m < 1) return "Now";
+        if(m < 60) return m + "m"; 
+        const h = Math.floor(m / 60); return h < 24 ? h + "h" : Math.floor(h / 24) + "d";
     }
 
     function updateLaunchButton(t) {
         const btn = document.getElementById('f4t-launch-btn');
-        if(btn) { btn.textContent = `🔍 (${t})`; btn.classList.add('pulse'); setTimeout(()=>btn.classList.remove('pulse'),500); }
+        if(btn) { 
+            btn.textContent = `🔍 (${t})`; 
+            btn.classList.add('pulse'); 
+            setTimeout(()=>btn.classList.remove('pulse'),500); 
+        }
     }
 
     window.addEventListener('load', () => {
