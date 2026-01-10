@@ -1,7 +1,6 @@
 // ==UserScript==
 // @name         Free4Talk Analyzer
-// @version      14.11.2
-// @description  Improve discoverability of F4T rooms
+// @version      16.3.23
 // @author       You
 // @match        https://www.free4talk.com/
 // @grant        GM_setValue
@@ -13,16 +12,13 @@
 (function() {
     'use strict';
 
-    // --- Global State ---
-    // We attach to unsafeWindow so the 'real' page can potentially see it, 
-    // or just to keep it on the main window object.
     unsafeWindow.F4T_DB = unsafeWindow.F4T_DB || new Map();
     let isOverlayOpen = false;
     let refreshInterval = null;
 
     // --- Configuration ---
-    const STORAGE_KEY = 'settings_v1';
-    
+    const STORAGE_KEY = 'f4t_settings';
+
     const F4T_LEVELS = [
         "Any Level", "Beginner", "Upper Beginner", 
         "Intermediate", "Upper Intermediate", 
@@ -38,45 +34,29 @@
         levels: [...F4T_LEVELS]
     };
 
-    // --- Helper: Reliable Load/Save ---
+    // --- Helper: Settings ---
     function getSettings() {
         const stored = GM_getValue(STORAGE_KEY, null);
-        console.log("[F4T] Loaded Settings:", stored);
-        if (stored && typeof stored === 'string') {
-            try {
-                // Merge defaults to ensure no missing keys
-                return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) };
-            } catch (e) {
-                console.error("[F4T] Parse Error", e);
-            }
+        if (stored) {
+            try { return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) }; } 
+            catch (e) {}
         }
         return DEFAULT_SETTINGS;
     }
 
     function saveSettings(settings) {
-        try {
-            const json = JSON.stringify(settings);
-            GM_setValue(STORAGE_KEY, json);
-            // console.log("[F4T] Saved:", json); // Uncomment to debug
-        } catch (e) { console.error("[F4T] Save Error", e); }
+        GM_setValue(STORAGE_KEY, JSON.stringify(settings));
     }
 
-    // --- Network Interceptor (Sandboxed) ---
-    // Since we are in sandbox (due to grants), we hook unsafeWindow.fetch
+    // --- Groups Data ---
     const originalFetch = unsafeWindow.fetch;
-    
-    // We must define the hook on the unsafeWindow to capture page requests
-    // Note: In some strict environments (Firefox), exportFunction might be needed,
-    // but usually direct assignment works for Chrome/Tampermonkey.
     unsafeWindow.fetch = async function(...args) {
         const response = await originalFetch.apply(this, args);
         const url = args[0] ? args[0].toString() : '';
 
         if (url.includes('/sync/get/free4talk/groups')) {
-            // Clone response to read body without consuming it
             const clone = response.clone();
             clone.json().then(json => {
-                // Must access unsafeWindow global for DB
                 if (json && json.data) {
                     Object.values(json.data).forEach(room => {
                         if (room.id) unsafeWindow.F4T_DB.set(room.id, room);
@@ -88,25 +68,26 @@
         return response;
     };
 
-    // --- Logic: Statistical Scoring ---
-    function calculateSmartScore(room) {
-        const clients = room.clients || [];
-        if (clients.length === 0) return -1;
+    function calculateIndividualScore(c) {
+        const following = c.following || 0;
+        const followers = c.followers || 0;
+        const friends = c.friends || 0;
 
-        const scores = clients.map(c => {
-            const following = c.following || 0;
-            const followers = c.followers || 0;
-            const friends = c.friends || 0;
+        const n = following + followers - friends;
+        c.score = (friends + 1) / (n + 2);
+        c.score *= 1 - 0.5 * (Math.abs(following - friends) + 1) / (n + 2);
+        c.score *= 1 - 0.5 * (Math.abs(followers - friends) + 1) / (n + 2);
 
-            c.score = (friends + 1) / (following + followers - friends + 2);
-            c.score *= 1 - 0.5 * (Math.abs(following - friends) + 1) / ((following + followers - friends) + 2);
-            c.score *= 1 - 0.5 * (Math.abs(followers - friends) + 1) / ((following + followers - friends) + 2);
-            return c.score;
-        });
+        return c.score;
+    }
 
-        const product = scores.reduce((acc, val) => acc * val, 1);
-        const geoMean = Math.pow(product, 1 / scores.length);
-        return Math.round(geoMean * 1000) / 100;
+    function calculateRoomScore(room) {
+        if (!room.clients || room.clients.length === 0) return 0;
+
+        let scores = room.clients.map(calculateIndividualScore);
+        let total = scores.reduce((acc, val) => acc + val, 0);
+
+        return Math.round((total + 0.5) / (scores.length + 1) * 1000) / 100
     }
 
     // --- UI Logic ---
@@ -146,25 +127,24 @@
                 </div>
                 <div class="f4t-field" style="flex:1.5">
                     <label>2nd Lang</label>
-                    <input type="text" id="f4t-sec" placeholder="E.g: None, Spanish">
+                    <input type="text" id="f4t-sec" placeholder="e.g. None, Spanish">
                 </div>
                 <div class="f4t-field" style="flex:0.8">
-                    <label>Min Slots</label>
-                    <input type="number" id="f4t-slots" min="0">
+                    <label>Free Slots</label>
+                    <input type="number" id="f4t-slots" value="1" min="0">
                 </div>
                 <div class="f4t-field" style="flex:1.5">
                     <label>Sort</label>
                     <select id="f4t-sort">
-                        <option value="score_desc">Score: High to Low</option>
-                        <option value="score_asc">Score: Low to High</option>
-                        <option value="recent">Recent</option>
+                        <option value="score_desc">High Score</option>
+                        <option value="recent">Newest First</option>
+                        <option value="full">Total Score</option>
                     </select>
                 </div>
-                
                 <div class="f4t-field-btn">
                     <label class="f4t-toggle-btn">
                         <input type="checkbox" id="f4t-req-mic">
-                        <span>🎤 Mic Only</span>
+                        <span>🎤 Mic On</span>
                     </label>
                 </div>
             </div>
@@ -176,26 +156,18 @@
 
         document.body.appendChild(overlay);
 
-        // --- RESTORE SETTINGS ---
-        // We explicitly set values AFTER adding elements to DOM
+        // Restore Settings
         const s = getSettings();
-        
         document.getElementById('f4t-lang').value = s.lang || "";
         document.getElementById('f4t-sec').value = s.secLang || "";
-        document.getElementById('f4t-slots').value = s.minSlots || 0;
+        document.getElementById('f4t-slots').value = (s.minSlots !== undefined) ? s.minSlots : 1;
         document.getElementById('f4t-sort').value = s.sort || "score_desc";
         document.getElementById('f4t-req-mic').checked = !!s.reqMic;
-
-        // Restore Levels
-        const boxes = overlay.querySelectorAll('.f4t-level-cb');
-        boxes.forEach(cb => {
+        overlay.querySelectorAll('.f4t-level-cb').forEach(cb => {
             cb.checked = s.levels.includes(cb.value);
         });
 
-        // Event Listeners
-        const inputs = overlay.querySelectorAll('input, select');
-        inputs.forEach(el => {
-            // 'input' fires on every keystroke, 'change' fires on blur/select
+        overlay.querySelectorAll('input, select').forEach(el => {
             el.addEventListener('input', () => { render(); }); 
             el.addEventListener('change', () => { render(); }); 
         });
@@ -203,7 +175,7 @@
         document.getElementById('f4t-close').onclick = closeOverlay;
 
         isOverlayOpen = true;
-        render(); // This will trigger a save, confirming persistence works immediately
+        render();
         refreshInterval = setInterval(render, 5000);
     }
 
@@ -218,37 +190,37 @@
     function render() {
         if (!isOverlayOpen) return;
 
-        // 1. Capture Values
+        // 1. Gather Inputs
         const searchVal = document.getElementById('f4t-search').value.toLowerCase().trim();
         const langVal = document.getElementById('f4t-lang').value.trim();
         const secValRaw = document.getElementById('f4t-sec').value;
-        const slotsVal = parseInt(document.getElementById('f4t-slots').value) || 0;
+        const slotsVal = parseInt(document.getElementById('f4t-slots').value);
+        const slotsNum = isNaN(slotsVal) ? 0 : slotsVal; 
         const sortVal = document.getElementById('f4t-sort').value;
         const micVal = document.getElementById('f4t-req-mic').checked;
-        const levelEls = document.querySelectorAll('.f4t-level-cb:checked');
-        const levelVals = Array.from(levelEls).map(cb => cb.value);
+        const levelVals = Array.from(document.querySelectorAll('.f4t-level-cb:checked')).map(cb => cb.value);
 
-        // 2. Save Immediately
+        // 2. Save
         saveSettings({
-            lang: langVal,
-            secLang: secValRaw,
-            minSlots: slotsVal,
-            sort: sortVal,
-            reqMic: micVal,
-            levels: levelVals
+            lang: langVal, secLang: secValRaw, minSlots: slotsNum,
+            sort: sortVal, reqMic: micVal, levels: levelVals
         });
 
-        // 3. Logic
-        const secList = secValRaw.split(',').map(s => s.trim()).filter(s => s !== "").map(s => s.toLowerCase() === 'none' ? "" : s);
+        // 3. Process Logic
+        const secList = secValRaw.split(',')
+            .map(s => s.trim())
+            .filter(s => s !== "")
+            .map(s => s.toLowerCase() === 'none' ? "" : s);
+
         const matchBadge = document.getElementById('f4t-match-count');
         const totalBadge = document.getElementById('f4t-total-count');
         const grid = document.getElementById('f4t-grid');
 
-        // Note: accessing unsafeWindow.F4T_DB here
         let items = Array.from(unsafeWindow.F4T_DB.values()).map(room => ({
             ...room,
-            _score: calculateSmartScore(room),
-            _date: new Date(room.createdAt)
+            _score: calculateRoomScore(room),
+            _date: new Date(room.createdAt),
+            _isNew: (Date.now() - new Date(room.createdAt).getTime()) < 1000 * 60 * 10
         }));
 
         items = items.filter(i => {
@@ -256,18 +228,23 @@
             if (searchVal) {
                 const topicMatch = (i.topic || "").toLowerCase().includes(searchVal);
                 const userMatch = i.clients.some(c => (c.name || "").toLowerCase().includes(searchVal));
-                if (!topicMatch && !userMatch) pass = false;
+                pass = topicMatch || userMatch;
             }
             if (pass && langVal && i.language !== langVal) pass = false;
             if (pass && !levelVals.includes(i.level)) pass = false;
+            
+            // Slots filter
             if (pass) {
                 if (!i.clients || i.clients.length === 0) pass = false;
-                else if (i.maxPeople > 0 && (i.maxPeople - i.clients.length < slotsVal)) pass = false;
+                else if (i.maxPeople > 0 && (i.maxPeople - i.clients.length < slotsNum)) pass = false;
             }
+            
+            // 2nd Lang filter
             if (pass && secValRaw.trim() !== "") {
                 const roomSec = i.secondLanguage || "";
                 pass = secList.includes(roomSec);
             }
+
             if (pass && micVal && i.settings.noMic) pass = false;
             if (pass && i.settings.isLocked) pass = false;
             return pass;
@@ -275,8 +252,8 @@
 
         items.sort((a, b) => {
             if (sortVal === 'score_desc') return b._score - a._score;
-            if (sortVal === 'score_asc') return a._score - b._score;
             if (sortVal === 'recent') return b._date - a._date;
+            if (sortVal === 'full') return b.clients.length * b._score - a.clients.length * a._score;
             return 0;
         });
 
@@ -284,31 +261,43 @@
         if (totalBadge) totalBadge.textContent = unsafeWindow.F4T_DB.size;
 
         if (items.length === 0) {
-            grid.innerHTML = '<div class="f4t-empty">No rooms match criteria</div>';
+            grid.innerHTML = '<div class="f4t-empty">No matching rooms found...</div>';
             return;
         }
 
         grid.innerHTML = items.map(item => {
-            const isRisky = item._score < 2.5;
-            const cardClass = isRisky ? 'f4t-card-neg' : '';
-            let scoreColor = item._score < 2.5 ? '#ff5252' : (item._score < 5.0 ? '#ffee58' : '#66bb6a');
-            const btnClass = isRisky ? 'f4t-btn-risky' : 'f4t-btn-safe';
-            const btnText = isRisky ? 'Join' : 'Join';
+            // --- ROOM SCORE COLOR LOGIC ---
+            let cardClass = 'f4t-card-pos'; // Default Green (>= 5.0)
+            let btnClass = 'f4t-btn-safe';
+            let btnText = 'Join';
+
+            if (item._score < 2.5) {
+                cardClass = 'f4t-card-neg';
+                btnClass = 'f4t-btn-risky';
+            } else if (item._score < 5.0) {
+                cardClass = 'f4t-card-neu';
+            }
 
             const members = item.clients.map(c => {
                 const isHost = c.id === item.creator.id;
-                const diff = (c.following || 0) - (c.followers || 0);
-                let statColor = c.score < .25 ? '#ff5252' : (c.score < .5 ? '#ffb74d' : '#66bb6a');
                 
+                // --- USER COLORS (0.25 / 0.5) ---
+                const uScore = calculateIndividualScore(c);
+                const statColor = uScore < 0.25 ? '#ff5252' : (uScore < 0.5 ? '#ffb74d' : '#66bb6a');
+                
+                const diff = (c.following || 0) - (c.followers || 0);
+
                 return `
                 <div class="f4t-mem">
                     <div class="f4t-ava-wrap">
                         <img src="${c.avatar}" class="f4t-ava" loading="lazy">
-                        ${isHost ? '<span class="f4t-host">HOST</span>' : ''}
+                        ${isHost ? '<span class="f4t-host-badge">HOST</span>' : ''}
                     </div>
                     <div class="f4t-mem-info">
                         <div class="f4t-mem-name">${escapeHtml(c.name)}</div>
-                        <div class="f4t-mem-stats" style="color:${statColor}">Diff: ${diff} | Fr: ${c.friends}</div>
+                        <div class="f4t-mem-stats" style="color:${statColor}">
+                            Diff: ${diff} | Fr: ${c.friends}
+                        </div>
                     </div>
                 </div>`;
             }).join('');
@@ -318,10 +307,13 @@
                 <div class="f4t-card-head">
                     <div class="f4t-head-left">
                         <div class="f4t-topic" title="${escapeHtml(item.topic)}">${escapeHtml(item.topic || "No Topic")}</div>
-                        <div class="f4t-meta">by ${escapeHtml(item.creator.name)} • ${getTimeAgo(item._date)}</div>
+                        <div class="f4t-meta">
+                            by ${escapeHtml(item.creator.name)} • ${getTimeAgo(item._date)}
+                            ${item._isNew ? '<span class="f4t-fresh">✨ NEW</span>' : ''}
+                        </div>
                     </div>
-                    <div class="f4t-score-box" style="color:${scoreColor}; border-color:${scoreColor}66;">
-                        <span>${item._score.toFixed(2)}</span>
+                    <div class="f4t-score-box" data-val="${item._score.toFixed(2)}">
+                        ${item._score.toFixed(2)}
                     </div>
                 </div>
                 <div class="f4t-tags">
@@ -339,21 +331,15 @@
     }
 
     function escapeHtml(t) { return t ? t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/"/g, "&quot;") : ""; }
-
     function getTimeAgo(d) {
         const m = Math.floor((new Date() - d) / 60000);
         if(m < 1) return "Now";
         if(m < 60) return m + "m"; 
         const h = Math.floor(m / 60); return h < 24 ? h + "h" : Math.floor(h / 24) + "d";
     }
-
     function updateLaunchButton(t) {
         const btn = document.getElementById('f4t-launch-btn');
-        if(btn) { 
-            btn.textContent = `🔍 (${t})`; 
-            btn.classList.add('pulse'); 
-            setTimeout(()=>btn.classList.remove('pulse'),500); 
-        }
+        if(btn) { btn.textContent = `🔍 (${t})`; btn.classList.add('pulse'); setTimeout(()=>btn.classList.remove('pulse'),500); }
     }
 
     window.addEventListener('load', () => {
@@ -371,140 +357,136 @@
 
             #f4t-launch-btn {
                 position: fixed; bottom: 20px; left: 20px;
-                background: #1e1e1e; color: #66bb6a; border: 1px solid #333;
-                padding: 10px 20px; border-radius: 50px; font-weight: 700;
-                z-index: 9999; box-shadow: 0 4px 15px rgba(0,0,0,0.5); cursor: pointer;
-                transition: 0.2s; font-family: system-ui;
+                background: linear-gradient(135deg, #1e1e1e, #2a2a2a); color: #66bb6a;
+                border: 1px solid #333; padding: 10px 24px; border-radius: 50px;
+                font-weight: 700; z-index: 9999; box-shadow: 0 4px 15px rgba(0,0,0,0.5);
+                cursor: pointer; transition: 0.2s; font-family: system-ui;
             }
-            #f4t-launch-btn:hover { background: #252525; transform: scale(1.05); }
-            #f4t-launch-btn.pulse { border-color: #66bb6a; box-shadow: 0 0 10px #66bb6a; }
+            #f4t-launch-btn:hover { transform: scale(1.05); color: #81c784; }
+            #f4t-launch-btn.pulse { box-shadow: 0 0 15px #66bb6a; border-color: #66bb6a; }
 
             #f4t-overlay {
-                position: fixed; top: 0; left: 2%; width: 96%; height: 100%;
+                position: fixed; top: 0; left: 0; width: 100%; height: 100%;
                 background: #0a0a0a; z-index: 10000; display: flex;
                 font-family: 'Segoe UI', system-ui, sans-serif;
             }
             .f4t-panel {
-                width: 100%; height: 100%; display: flex; flex-direction: column;
-                background: #121212;
+                width: 96%; max-width: 1600px; height: 100%; margin: 0 auto;
+                background: #121212; border-left: 1px solid #222; border-right: 1px solid #222;
+                display: flex; flex-direction: column;
             }
 
             .f4t-header {
-                display: flex; align-items: center; padding: 10px 20px;
-                background: #1e1e1e; border-bottom: 1px solid #333; gap: 20px;
+                display: flex; align-items: center; padding: 15px 25px;
+                background: #181818; border-bottom: 1px solid #2a2a2a; gap: 20px;
             }
-            .f4t-brand { display: flex; align-items: center; gap: 10px; min-width: max-content; }
-            .f4t-brand h2 { margin: 0; color: #66bb6a; font-size: 1.4rem; }
-            .f4t-counts { color: #888; font-size: 0.9rem; font-weight: bold; background: #111; padding: 3px 10px; border-radius: 6px; }
+            .f4t-brand h2 { margin: 0; color: #66bb6a; font-size: 1.5rem; letter-spacing: -0.5px; }
+            .f4t-counts { color: #666; font-size: 0.9rem; font-weight: bold; margin-top: 4px; }
             
+            /* Search Bar */
             .f4t-search-container { flex: 1; display: flex; }
             #f4t-search {
-                width: 100%; background: #0a0a0a; border: 1px solid #333; color: #fff;
-                padding: 8px 15px; border-radius: 6px; font-size: 1rem;
+                width: 100%; background: #000; border: 1px solid #333; color: #eee;
+                padding: 10px 18px; border-radius: 8px; font-size: 1rem;
             }
             #f4t-search:focus { border-color: #66bb6a; outline: none; }
-
-            #f4t-close { background: none; border: none; color: #888; font-size: 1.5rem; cursor: pointer; padding: 0 15px; }
-            #f4t-close:hover { color: #ff5252; }
+            #f4t-close { background: none; border: none; color: #666; font-size: 1.8rem; cursor: pointer; padding: 0 15px; }
+            #f4t-close:hover { color: #fff; }
 
             .f4t-toolbar {
-                display: flex; gap: 15px; padding: 12px 20px; background: #1a1a1a;
-                border-bottom: 1px solid #333; align-items: flex-end; flex-wrap: wrap;
+                display: flex; gap: 15px; padding: 15px 25px; background: #151515;
+                border-bottom: 1px solid #2a2a2a; align-items: flex-end; flex-wrap: wrap;
             }
-            .f4t-field { display: flex; flex-direction: column; gap: 4px; min-width: 80px; flex: 1; }
-            .f4t-field label { font-size: 0.75rem; color: #999; font-weight: 700; text-transform: uppercase; }
+            .f4t-field { display: flex; flex-direction: column; gap: 5px; min-width: 100px; flex: 1; }
+            .f4t-field label { font-size: 0.7rem; color: #888; font-weight: 700; text-transform: uppercase; letter-spacing: 0.5px; }
             .f4t-field input, .f4t-field select {
-                height: 38px; box-sizing: border-box;
-                background: #2c2c2c; border: 1px solid #444; color: #eee;
-                padding: 0 12px; border-radius: 6px; font-size: 1rem; width: 100%;
+                height: 40px; background: #222; border: 1px solid #333; color: #ddd;
+                padding: 0 12px; border-radius: 6px; font-size: 0.95rem; width: 100%;
             }
-            .f4t-field input::placeholder { color: #666; font-style: italic; }
             
-            .f4t-field-btn { display: flex; flex-direction: column; justify-content: flex-end; }
             .f4t-toggle-btn {
-                height: 38px; display: flex; align-items: center; padding: 0 16px;
-                background: #2a2a2a; border: 1px solid #444; border-radius: 6px;
-                cursor: pointer; user-select: none; transition: 0.2s; white-space: nowrap;
+                height: 40px; display: flex; align-items: center; padding: 0 16px;
+                background: #222; border: 1px solid #333; border-radius: 6px;
+                cursor: pointer; user-select: none; transition: 0.2s;
             }
             .f4t-toggle-btn input { display: none; }
-            .f4t-toggle-btn span { font-size: 1rem; color: #aaa; font-weight: 600; }
+            .f4t-toggle-btn span { font-size: 0.9rem; color: #aaa; font-weight: 600; }
+            .f4t-toggle-btn:has(input:checked) { background: #1b3320; border-color: #4caf50; }
             .f4t-toggle-btn input:checked + span { color: #fff; }
-            .f4t-toggle-btn:has(input:checked) { background: #1b3320; border-color: #66bb6a; }
 
             .f4t-level-bar {
-                display: flex; gap: 8px; padding: 10px 20px; background: #181818;
-                border-bottom: 1px solid #333; overflow-x: auto;
+                display: flex; gap: 8px; padding: 10px 25px; background: #151515;
+                border-bottom: 1px solid #2a2a2a; overflow-x: auto;
             }
-            .f4t-chip { cursor: pointer; user-select: none; }
             .f4t-chip input { display: none; }
             .f4t-chip span {
-                display: block; padding: 6px 14px; background: #222; border: 1px solid #333;
-                border-radius: 50px; font-size: 0.85rem; color: #888; transition: 0.15s; white-space: nowrap;
+                display: block; padding: 5px 14px; background: #222; border: 1px solid #333;
+                border-radius: 50px; font-size: 0.8rem; color: #777; transition: 0.15s; white-space: nowrap; cursor: pointer;
             }
             .f4t-chip input:checked + span {
-                background: #333; color: #66bb6a; border-color: #66bb6a; font-weight: bold;
+                background: #2e3b30; color: #81c784; border-color: #4caf50; font-weight: 600;
             }
 
             .f4t-grid {
                 flex: 1; overflow-y: auto; padding: 25px;
-                display: grid; grid-template-columns: repeat(auto-fill, minmax(480px, 1fr));
-                gap: 25px; align-content: flex-start;
+                display: grid; grid-template-columns: repeat(auto-fill, minmax(420px, 1fr));
+                gap: 20px; align-content: flex-start;
             }
-            .f4t-empty { width: 100%; text-align: center; margin-top: 50px; color: #444; font-size: 1.5rem; }
+            .f4t-empty { grid-column: 1/-1; text-align: center; margin-top: 80px; color: #444; font-size: 1.2rem; }
 
             .f4t-card {
-                background: #1e1e1e; border: 1px solid #333; border-radius: 12px;
+                background: #1c1c1c; border: 1px solid #333; border-radius: 10px;
                 display: flex; flex-direction: column; overflow: hidden; height: max-content;
-                box-shadow: 0 4px 6px rgba(0,0,0,0.2);
+                box-shadow: 0 2px 10px rgba(0,0,0,0.2); transition: transform 0.2s;
             }
-            .f4t-card:hover { border-color: #555; transform: translateY(-2px); transition: 0.2s; }
-            .f4t-card-neg { border-color: #3d1a1a; }
-            .f4t-card-neg:hover { border-color: #ff5252; }
-
-            .f4t-card-head {
-                padding: 15px; background: #252525; border-bottom: 1px solid #333;
-                display: flex; justify-content: space-between;
-            }
-            .f4t-head-left { overflow: hidden; margin-right: 15px; }
-            .f4t-topic { font-weight: 700; color: #eee; font-size: 1.15rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-            .f4t-meta { font-size: 0.85rem; color: #999; margin-top: 4px; }
+            .f4t-card:hover { transform: translateY(-3px); border-color: #555; }
             
+            /* --- Room Color Classes --- */
+            .f4t-card-pos { border: 1px solid #333; }
+            .f4t-card-pos:hover { border-color: #66bb6a; }
+            .f4t-card-pos .f4t-card-head { background: #222; }
+            .f4t-card-pos .f4t-score-box { color: #66bb6a; }
+
+            .f4t-card-neu { border-color: #5d561b; opacity: 0.95; }
+            .f4t-card-neu:hover { border-color: #ffee58; opacity: 1; }
+            .f4t-card-neu .f4t-score-box { color: #ffee58; }
+
+            .f4t-card-neg { border-color: #4a2a2a; opacity: 0.85; }
+            .f4t-card-neg:hover { border-color: #ff5252; opacity: 1; }
+            .f4t-card-neg .f4t-score-box { color: #ff5252; }
+
+            .f4t-card-head { padding: 14px; background: #222; border-bottom: 1px solid #2e2e2e; display: flex; justify-content: space-between; }
+            .f4t-head-left { overflow: hidden; margin-right: 12px; }
+            .f4t-topic { font-weight: 700; color: #eee; font-size: 1.1rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .f4t-meta { font-size: 0.8rem; color: #888; margin-top: 4px; display: flex; align-items: center; gap: 8px; }
+            .f4t-fresh { color: #ffd700; font-weight: bold; font-size: 0.7rem; background: rgba(255, 215, 0, 0.1); padding: 1px 5px; border-radius: 4px; }
+
             .f4t-score-box {
-                padding: 4px 12px; border-radius: 6px; font-family: monospace; font-weight: bold;
-                border: 1px solid transparent; height: fit-content; font-size: 1.1rem;
+                font-family: monospace; font-weight: 700; font-size: 1.2rem;
             }
 
-            .f4t-tags { padding: 10px 15px; background: #222; display: flex; gap: 8px; flex-wrap: wrap; }
-            .f4t-tag { font-size: 0.8rem; padding: 4px 10px; border-radius: 6px; color: #fff; }
-            .f4t-tag-lang { background: #1565C0; }
-            .f4t-tag-base { background: #444; }
-            .f4t-tag-sec { background: #7B1FA2; }
+            .f4t-tags { padding: 8px 14px; background: #1a1a1a; display: flex; gap: 6px; flex-wrap: wrap; }
+            .f4t-tag { font-size: 0.75rem; padding: 2px 8px; border-radius: 4px; color: #ddd; background: #333; }
+            .f4t-tag-lang { background: #1565C0; color: #fff; }
+            .f4t-tag-sec { background: #7B1FA2; color: #fff; }
 
-            .f4t-members { max-height: 240px; overflow-y: auto; background: #1a1a1a; flex: 1; }
-            .f4t-members::-webkit-scrollbar { width: 6px; }
-            .f4t-members::-webkit-scrollbar-thumb { background: #444; border-radius: 3px; }
-
-            .f4t-mem { display: flex; align-items: center; padding: 10px 15px; border-bottom: 1px solid #2a2a2a; }
-            .f4t-ava-wrap { position: relative; margin-right: 15px; }
-            .f4t-ava { width: 42px; height: 42px; border-radius: 50%; background: #333; border: 2px solid #333; }
-            .f4t-host { position: absolute; bottom: -2px; right: -2px; background: #2196F3; color:#fff; font-size:0.6rem; padding:2px 4px; border-radius: 4px; }
-            .f4t-mem-info { overflow: hidden; }
-            .f4t-mem-name { font-size: 1rem; color: #eee; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-weight: 600; }
-            .f4t-mem-stats { font-size: 0.8rem; font-family: monospace; }
-
-            .f4t-footer {
-                padding: 12px 15px; background: #252525; border-top: 1px solid #333;
-                display: flex; justify-content: space-between; align-items: center;
-            }
-            .f4t-cap { font-size: 0.9rem; color: #999; font-weight: 600; }
+            .f4t-members { max-height: 220px; overflow-y: auto; background: #181818; flex: 1; }
+            .f4t-mem { display: flex; align-items: center; padding: 8px 14px; border-bottom: 1px solid #252525; }
+            .f4t-ava-wrap { position: relative; margin-right: 12px; }
+            .f4t-ava { width: 36px; height: 36px; border-radius: 50%; border: 2px solid #333; }
+            .f4t-host-badge { position: absolute; bottom: -4px; right: -4px; background: #1e88e5; color:#fff; font-size:0.6rem; padding:1px 3px; border-radius: 3px; }
             
-            .f4t-join {
-                text-decoration: none; padding: 8px 20px; border-radius: 8px;
-                font-size: 0.95rem; font-weight: 700;
-            }
-            .f4t-btn-safe { background: #66bb6a; color: #000; }
-            .f4t-btn-safe:hover { background: #81c784; }
-            .f4t-btn-risky { background: #c62828; color: #fff; opacity: 0.8; }
+            .f4t-mem-info { flex: 1; overflow: hidden; }
+            .f4t-mem-name { font-size: 0.95rem; color: #e0e0e0; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+            .f4t-mem-stats { font-size: 0.75rem; color: #666; font-family: monospace; }
+
+            .f4t-footer { padding: 10px 14px; background: #222; border-top: 1px solid #2e2e2e; display: flex; justify-content: space-between; align-items: center; }
+            .f4t-cap { font-size: 0.85rem; color: #888; font-weight: 600; }
+            
+            .f4t-join { text-decoration: none; padding: 6px 18px; border-radius: 6px; font-size: 0.9rem; font-weight: 700; }
+            .f4t-btn-safe { background: #4caf50; color: #000; }
+            .f4t-btn-safe:hover { background: #66bb6a; }
+            .f4t-btn-risky { background: #d32f2f; color: #fff; opacity: 0.8; }
             .f4t-btn-risky:hover { opacity: 1; }
         `;
         document.head.appendChild(style);
