@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Free4Talk Analyzer
-// @version      16.3.23
+// @version      17.0.2
 // @author       You
 // @match        https://www.free4talk.com/
 // @grant        GM_setValue
@@ -20,8 +20,8 @@
     const STORAGE_KEY = 'f4t_settings';
 
     const F4T_LEVELS = [
-        "Any Level", "Beginner", "Upper Beginner", 
-        "Intermediate", "Upper Intermediate", 
+        "Any Level", "Beginner", "Upper Beginner",
+        "Intermediate", "Upper Intermediate",
         "Advanced", "Upper Advanced"
     ];
 
@@ -38,7 +38,7 @@
     function getSettings() {
         const stored = GM_getValue(STORAGE_KEY, null);
         if (stored) {
-            try { return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) }; } 
+            try { return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) }; }
             catch (e) {}
         }
         return DEFAULT_SETTINGS;
@@ -48,32 +48,34 @@
         GM_setValue(STORAGE_KEY, JSON.stringify(settings));
     }
 
-    // --- Groups Data ---
-    const originalFetch = unsafeWindow.fetch;
-    unsafeWindow.fetch = async function(...args) {
-        const response = await originalFetch.apply(this, args);
-        const url = args[0] ? args[0].toString() : '';
-
-        if (url.includes('/sync/get/free4talk/groups')) {
-            const clone = response.clone();
-            clone.json().then(json => {
-                if (json && json.data) {
-                    Object.values(json.data).forEach(room => {
-                        if (room.id) unsafeWindow.F4T_DB.set(room.id, room);
+    window.addEventListener('message', function(event) {
+        try {
+            const rawData = event.target.localStorage["groups:groupMap"];
+            if (rawData) {
+                const parsed = JSON.parse(rawData);
+                if (parsed && parsed.data) {
+                    unsafeWindow.F4T_DB.clear();
+                    Object.values(parsed.data).forEach(room => {
+                        if (room.id) {
+                            unsafeWindow.F4T_DB.set(room.id, room);
+                        }
                     });
                     updateLaunchButton(unsafeWindow.F4T_DB.size);
                 }
-            }).catch(() => {});
+            }
+        } catch (e) {
+            console.error("F4T Analyzer: Error reading target storage", e);
         }
-        return response;
-    };
+    });
 
+    // --- Logic: Scoring ---
     function calculateIndividualScore(c) {
         const following = c.following || 0;
         const followers = c.followers || 0;
         const friends = c.friends || 0;
 
         const n = following + followers - friends;
+
         c.score = (friends + 1) / (n + 2);
         c.score *= 1 - 0.5 * (Math.abs(following - friends) + 1) / (n + 2);
         c.score *= 1 - 0.5 * (Math.abs(followers - friends) + 1) / (n + 2);
@@ -87,7 +89,7 @@
         let scores = room.clients.map(calculateIndividualScore);
         let total = scores.reduce((acc, val) => acc + val, 0);
 
-        return Math.round((total + 0.5) / (scores.length + 1) * 1000) / 100
+        return Math.round((total + 0.5) / (scores.length + 1) * 1000) / 100;
     }
 
     // --- UI Logic ---
@@ -136,9 +138,9 @@
                 <div class="f4t-field" style="flex:1.5">
                     <label>Sort</label>
                     <select id="f4t-sort">
-                        <option value="score_desc">High Score</option>
+                        <option value="score_desc">Score</option>
                         <option value="recent">Newest First</option>
-                        <option value="full">Total Score</option>
+                        <option value="full">Big Rooms</option>
                     </select>
                 </div>
                 <div class="f4t-field-btn">
@@ -253,7 +255,7 @@
         items.sort((a, b) => {
             if (sortVal === 'score_desc') return b._score - a._score;
             if (sortVal === 'recent') return b._date - a._date;
-            if (sortVal === 'full') return b.clients.length * b._score - a.clients.length * a._score;
+            if (sortVal === 'full') return (b.clients.length * b._score * b._score - a.clients.length * a._score * a._score);
             return 0;
         });
 
