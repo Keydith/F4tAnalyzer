@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Free4Talk Analyzer
-// @version      17.0.26
+// @version      17.1.1
 // @author       You
 // @match        https://www.free4talk.com/
 // @grant        GM_setValue
@@ -85,6 +85,9 @@
 
         let scores = room.clients.map(calculateIndividualScore);
         let total = scores.reduce((acc, val) => acc + val, 0);
+
+        // Half score for older than 10min rooms
+        total *= (Date.now() - new Date(room.createdAt).getTime() < 1000 * 60 * 10) ? 1 : 0.5
 
         return Math.round((total + 0.5) / (scores.length + 1) * 1000) / 100;
     }
