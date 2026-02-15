@@ -1,6 +1,6 @@
 // ==UserScript==
 // @name         Free4Talk Analyzer
-// @version      17.1.1
+// @version      17.4.0
 // @author       You
 // @match        https://www.free4talk.com/
 // @grant        GM_setValue
@@ -30,14 +30,18 @@
         minSlots: 1,
         sort: "score_desc",
         micOn: true,
-        levels: [...F4T_LEVELS]
+        levels: [...F4T_LEVELS],
+        blockedUsers: [] // { id, name }
     };
 
     // --- Helper: Settings ---
     function getSettings() {
         const stored = GM_getValue(STORAGE_KEY, null);
         if (stored) {
-            try { return { ...DEFAULT_SETTINGS, ...JSON.parse(stored) }; }
+            try {
+                const parsed = JSON.parse(stored);
+                return { ...DEFAULT_SETTINGS, ...parsed, blockedUsers: parsed.blockedUsers || [] };
+            }
             catch (e) {}
         }
         return DEFAULT_SETTINGS;
@@ -45,6 +49,19 @@
 
     function saveSettings(settings) {
         GM_setValue(STORAGE_KEY, JSON.stringify(settings));
+    }
+
+    function toggleBlockUser(id, name) {
+        const s = getSettings();
+        const existingIndex = s.blockedUsers.findIndex(u => u.id === id);
+
+        if (existingIndex >= 0) {
+            s.blockedUsers.splice(existingIndex, 1); // Unblock
+        } else {
+            s.blockedUsers.push({ id, name }); // Block
+        }
+        saveSettings(s);
+        render(); // Re-render
     }
 
     window.addEventListener('message', function (event) {
@@ -65,7 +82,12 @@
         }
     });
 
-    // --- Logic: Scoring ---
+    function getAgeFactor(minutesOld) {
+        const halfLife = 120;
+        const floor = 0.5;
+        return floor + (1 - floor) * Math.pow(0.5, Math.max(minutesOld, 0) / halfLife);
+    }
+
     function calculateIndividualScore(c) {
         const following = c.following || 0;
         const followers = c.followers || 0;
@@ -84,12 +106,12 @@
         if (!room.clients || room.clients.length === 0) return 0;
 
         let scores = room.clients.map(calculateIndividualScore);
-        let total = scores.reduce((acc, val) => acc + val, 0);
+        let avgReciprocity = scores.reduce((a, b) => a + b, 0.5) / (scores.length + 1);
 
-        // Half score for older than 10min rooms
-        total *= (Date.now() - new Date(room.createdAt).getTime() < 1000 * 60 * 10) ? 1 : 0.5
+        let minutesOld = (Date.now() - new Date(room.createdAt).getTime()) / (1000 * 60);
+        let timeFactor = getAgeFactor(minutesOld);
 
-        return Math.round((total + 0.5) / (scores.length + 1) * 1000) / 100;
+        return Math.round(avgReciprocity * timeFactor * 1000) / 100;
     }
 
     // --- UI Logic ---
@@ -111,7 +133,6 @@
         <div class="f4t-panel">
             <div class="f4t-header">
                 <div class="f4t-brand">
-                    <h2>F4T Analyzer</h2>
                     <div class="f4t-counts">
                         <span id="f4t-match-count">0</span> / <span id="f4t-total-count">0</span>
                     </div>
@@ -152,6 +173,7 @@
             </div>
 
             <div class="f4t-level-bar">${levelChecksHtml}</div>
+            
             <div id="f4t-grid" class="f4t-grid"></div>
         </div>
         `;
@@ -166,6 +188,22 @@
         });
 
         document.getElementById('f4t-close').onclick = closeOverlay;
+
+        // Unified Click Handler for Block/Unblock inside Grid
+        document.getElementById('f4t-grid').addEventListener('click', (e) => {
+            // Block
+            const blockBtn = e.target.closest('.f4t-block-btn');
+            if (blockBtn) {
+                toggleBlockUser(blockBtn.dataset.id, blockBtn.dataset.name);
+                return;
+            }
+            // Unblock
+            const unblockBtn = e.target.closest('.f4t-unblock-btn');
+            if (unblockBtn) {
+                toggleBlockUser(unblockBtn.dataset.id, '');
+                return;
+            }
+        });
 
         isOverlayOpen = true;
         render();
@@ -206,10 +244,15 @@
         const micVal = document.getElementById('f4t-req-mic').checked;
         const levelVals = Array.from(document.querySelectorAll('.f4t-level-cb:checked')).map(cb => cb.value);
 
+        const currentSettings = getSettings();
+        const blockedUsers = currentSettings.blockedUsers || [];
+        const blockedIds = blockedUsers.map(u => u.id);
+
         // 2. Save
         saveSettings({
             lang: langVal, secLang: secValRaw, minSlots: slotsNum,
-            sort: sortVal, micOn: micVal, levels: levelVals
+            sort: sortVal, micOn: micVal, levels: levelVals,
+            blockedUsers: blockedUsers
         });
 
         restoreSettings();
@@ -232,6 +275,8 @@
         }));
 
         items = items.filter(i => {
+            if (i.creator && blockedIds.includes(i.creator.id)) return false;
+
             let pass = true;
             if (searchVal) {
                 const topicMatch = (i.topic || "").toLowerCase().includes(searchVal);
@@ -241,13 +286,11 @@
             if (pass && langVal && i.language !== langVal) pass = false;
             if (pass && !levelVals.includes(i.level)) pass = false;
 
-            // Slots filter
             if (pass) {
                 if (!i.clients || i.clients.length === 0) pass = false;
                 else if (i.maxPeople > 0 && (i.maxPeople - i.clients.length < slotsNum)) pass = false;
             }
 
-            // 2nd Lang filter
             if (pass && secValRaw.trim() !== "") {
                 const roomSec = i.secondLanguage || "";
                 pass = secList.includes(roomSec);
@@ -268,72 +311,95 @@
         if (matchBadge) matchBadge.textContent = items.length;
         if (totalBadge) totalBadge.textContent = F4T_DB.size;
 
-        if (items.length === 0) {
-            grid.innerHTML = '<div class="f4t-empty">No matching rooms found...</div>';
-            return;
+        // Generate Blocked HTML
+        let blockedHTML = '';
+        if (blockedUsers.length > 0) {
+            blockedHTML = `
+            <div class="f4t-blocked-area">
+                <div class="f4t-blocked-title">Blocked Users (${blockedUsers.length})</div>
+                <div class="f4t-blocked-list">
+                    ${blockedUsers.map(u => `
+                        <span class="f4t-blocked-tag">
+                            ${u.name} 
+                            <button class="f4t-unblock-btn" data-id="${u.id}">✕</button>
+                        </span>
+                    `).join('')}
+                </div>
+            </div>`;
         }
 
-        grid.innerHTML = items.map(item => {
-            // --- ROOM SCORE COLOR LOGIC ---
-            let cardClass = 'f4t-card-pos'; // Default Green (>= 5.0)
-            let btnClass = 'f4t-btn-safe';
-            let btnText = 'Join';
+        // Generate Cards HTML
+        let cardsHTML = '';
+        if (items.length === 0) {
+            cardsHTML = '<div class="f4t-empty">No matching rooms found...</div>';
+        } else {
+            cardsHTML = items.map(item => {
+                let cardClass = 'f4t-card-pos';
+                let btnClass = 'f4t-btn-safe';
+                let btnText = 'Join';
 
-            if (item._score < 2.5) {
-                cardClass = 'f4t-card-neg';
-                btnClass = 'f4t-btn-risky';
-            } else if (item._score < 5.0) {
-                cardClass = 'f4t-card-neu';
-            }
+                if (item._score < 2.5) {
+                    cardClass = 'f4t-card-neg';
+                    btnClass = 'f4t-btn-risky';
+                } else if (item._score < 5.0) {
+                    cardClass = 'f4t-card-neu';
+                }
 
-            const members = item.clients.map(c => {
-                const isHost = c.id === item.creator.id;
+                const members = item.clients.map(c => {
+                    const isHost = c.id === item.creator.id;
+                    const isBlocked = blockedIds.includes(c.id);
+                    const uScore = calculateIndividualScore(c);
+                    const statColor = uScore < 0.25 ? '#ff5252' : (uScore < 0.5 ? '#ffb74d' : '#66bb6a');
+                    
+                    const blockBtn = `
+                        <button class="f4t-block-btn" data-id="${c.id}" data-name="${c.name}" title="Block User">
+                            🚫
+                        </button>
+                    `;
 
-                // --- USER COLORS (0.25 / 0.5) ---
-                const uScore = calculateIndividualScore(c);
-                const statColor = uScore < 0.25 ? '#ff5252' : (uScore < 0.5 ? '#ffb74d' : '#66bb6a');
+                    return `
+                    <div class="f4t-mem ${isBlocked ? 'f4t-mem-blocked' : ''}">
+                        <div class="f4t-ava-wrap">
+                            <img src="${c.avatar}" class="f4t-ava" loading="lazy">
+                            ${isHost ? '<span class="f4t-host-badge">HOST</span>' : ''}
+                        </div>
+                        <div class="f4t-mem-info">
+                            <div class="f4t-mem-name">${c.name}</div>
+                            <div class="f4t-mem-stats" style="color:${statColor}">
+                                Diff: ${c.friends - c.followers} ${c.following - c.friends} | ${c.friends} Fr
+                            </div>
+                        </div>
+                        <div class="f4t-mem-actions">${blockBtn}</div>
+                    </div>`;
+                }).join('');
 
                 return `
-                <div class="f4t-mem">
-                    <div class="f4t-ava-wrap">
-                        <img src="${c.avatar}" class="f4t-ava" loading="lazy">
-                        ${isHost ? '<span class="f4t-host-badge">HOST</span>' : ''}
-                    </div>
-                    <div class="f4t-mem-info">
-                        <div class="f4t-mem-name">${c.name}</div>
-                        <div class="f4t-mem-stats" style="color:${statColor}">
-                            Diff: ${c.friends - c.followers} ${c.following - c.friends} | ${c.friends} Fr
+                <div class="f4t-card ${cardClass}">
+                    <div class="f4t-card-head">
+                        <div class="f4t-head-left">
+                            <div class="f4t-topic" title="${item.topic}">${item.topic || "No Topic"}</div>
+                            <div class="f4t-meta">
+                                by ${item.creator.name} • ${timeSince(item._date)}
+                                ${item._isNew ? '<span class="f4t-fresh">✨ NEW</span>' : ''}
+                            </div>
                         </div>
+                        <div class="f4t-score-box">${item._score.toFixed(2)}</div>
+                    </div>
+                    <div class="f4t-tags">
+                        <span class="f4t-tag f4t-tag-lang">${item.language}</span>
+                        <span class="f4t-tag f4t-tag-base">${item.level}</span>
+                        ${item.secondLanguage ? `<span class="f4t-tag f4t-tag-sec">${item.secondLanguage}</span>` : ''}
+                    </div>
+                    <div class="f4t-members">${members}</div>
+                    <div class="f4t-footer">
+                        <div class="f4t-cap">👥 ${item.clients.length} / ${item.maxPeople || '∞'}</div>
+                        <a href="${item.url}" target="_blank" class="f4t-join ${btnClass}">${btnText}</a>
                     </div>
                 </div>`;
             }).join('');
+        }
 
-            return `
-            <div class="f4t-card ${cardClass}">
-                <div class="f4t-card-head">
-                    <div class="f4t-head-left">
-                        <div class="f4t-topic" title="${item.topic}">${item.topic || "No Topic"}</div>
-                        <div class="f4t-meta">
-                            by ${item.creator.name} • ${timeSince(item._date)}
-                            ${item._isNew ? '<span class="f4t-fresh">✨ NEW</span>' : ''}
-                        </div>
-                    </div>
-                    <div class="f4t-score-box" data-val="${item._score.toFixed(2)}">
-                        ${item._score.toFixed(2)}
-                    </div>
-                </div>
-                <div class="f4t-tags">
-                    <span class="f4t-tag f4t-tag-lang">${item.language}</span>
-                    <span class="f4t-tag f4t-tag-base">${item.level}</span>
-                    ${item.secondLanguage ? `<span class="f4t-tag f4t-tag-sec">${item.secondLanguage}</span>` : ''}
-                </div>
-                <div class="f4t-members">${members}</div>
-                <div class="f4t-footer">
-                    <div class="f4t-cap">👥 ${item.clients.length} / ${item.maxPeople || '∞'}</div>
-                    <a href="${item.url}" target="_blank" class="f4t-join ${btnClass}">${btnText}</a>
-                </div>
-            </div>`;
-        }).join('');
+        grid.innerHTML = cardsHTML + blockedHTML;
     }
 
     function timeSince(d) {
@@ -435,10 +501,10 @@ body.f4t-focus-mode>*:not(#f4t-overlay):not(#f4t-launch-btn) {
     gap: 20px;
 }
 
-.f4t-brand h2 {
+.f4t-brand h3 {
     margin: 0;
     color: #66bb6a;
-    font-size: 1.5rem;
+    font-size: 1.25rem;
     letter-spacing: -0.5px;
 }
 
@@ -752,6 +818,10 @@ body.f4t-focus-mode>*:not(#f4t-overlay):not(#f4t-launch-btn) {
     border-bottom: 1px solid #252525;
 }
 
+.f4t-mem-blocked {
+    opacity: 0.4;
+}
+
 .f4t-ava-wrap {
     position: relative;
     margin-right: 12px;
@@ -795,6 +865,19 @@ body.f4t-focus-mode>*:not(#f4t-overlay):not(#f4t-launch-btn) {
     font-family: monospace;
 }
 
+.f4t-block-btn {
+    background: none;
+    border: none;
+    cursor: pointer;
+    font-size: 1rem;
+    padding: 4px;
+    opacity: 0.3;
+    transition: opacity 0.2s;
+}
+.f4t-block-btn:hover {
+    opacity: 1;
+}
+
 .f4t-footer {
     padding: 10px 14px;
     background: #222;
@@ -835,6 +918,51 @@ body.f4t-focus-mode>*:not(#f4t-overlay):not(#f4t-launch-btn) {
 
 .f4t-btn-risky:hover {
     opacity: 1;
+}
+
+/* Blocked Area */
+.f4t-blocked-area {
+    grid-column: 1 / -1;
+    margin-top: 40px;
+    padding: 20px;
+    border-top: 1px solid #333;
+    background: #0e0e0e;
+    border-radius: 8px;
+}
+.f4t-blocked-title {
+    font-size: 0.9rem;
+    color: #888;
+    font-weight: bold;
+    margin-bottom: 12px;
+}
+.f4t-blocked-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+.f4t-blocked-tag {
+    background: #322;
+    border: 1px solid #422;
+    color: #eaa;
+    font-size: 0.8rem;
+    padding: 4px 10px;
+    border-radius: 4px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.f4t-unblock-btn {
+    background: none;
+    border: none;
+    color: #eaa;
+    cursor: pointer;
+    font-weight: bold;
+    font-size: 0.9rem;
+    opacity: 0.7;
+}
+.f4t-unblock-btn:hover {
+    opacity: 1;
+    color: #fff;
 }
         `;
         document.head.appendChild(style);
